@@ -1,60 +1,10 @@
-# Phase 2 roadmap
+# Phase 3 roadmap
 
-The MVP is a secure, idempotent single-node deployment (see the root
-README and `docs/architecture.md`). Everything below is designed for but
-not yet built - nothing here should be assumed to work until it's
-actually implemented and verified against a real run, per this
-project's own discipline.
+Phase 1 (secure single-node MVP) and Phase 2 (scale-out/in, backup/restore,
+HAProxy, monitoring) are both built and verified for real - see
+`docs/architecture.md`. What's left:
 
-## Licensing note (relevant as soon as Phase 2 adds a 2nd/3rd node)
-
-Self-hosted CockroachDB is under the **CockroachDB Software License**
-(applies from v24.3 onward) - free for individual developers, students,
-and organizations under $10M annual revenue. **A single-node cluster
-needs no license key at all** (the MVP's current state). A 3-node
-cluster gets a **7-day grace period** before CockroachDB requires a
-(free or paid) license key. Get the license key situation sorted
-*before* scale-out, not after the grace period expires mid-Phase-2
-testing.
-
-## Scale-out (`ACTION=scale-out`)
-
-- Jenkins parameters: `TARGET_NODE`, `TARGET_HOST`.
-- Ansible flow: validate host → prepare storage (same `preflight` checks
-  as deploy) → deploy certs (extend `cockroach_tls`'s distribution step,
-  already written but only exercised as a no-op so far since this
-  sandbox has no second host) → generate compose for the new node → join
-  existing cluster → verify node membership (`cockroach node status`
-  shows the new node) → monitor rebalancing.
-- Add the new host to `inventory/hosts.ini` and rerun `deploy.yml` should
-  cover most of this already, since `--join` is computed from the whole
-  `cockroach_nodes` group automatically - confirm this is actually true
-  once a second real host exists, don't assume it.
-
-## Scale-in (`ACTION=scale-in`)
-
-Never `docker compose down` alone. Workflow: select node → cluster
-health check → check replication is sufficient without this node →
-`cockroach node decommission <id>` → wait for rebalancing/replica
-evacuation to finish → verify evacuation → stop the container → data
-removal as a **separate**, manually-confirmed operation. Requires a
-Jenkins manual-approval stage.
-
-## Backup / Restore (`ACTION=backup` / `restore`)
-
-- `BACKUP` to S3-compatible object storage (reuse the same RustFS
-  instance/pattern already running for `gitlab-backup-with-jenkins-ansible`,
-  or a dedicated bucket).
-- Full + incremental, retention, encryption, verification via a real
-  restore test - the exact discipline already proven in
-  `gitlab-backup-with-jenkins-ansible` (sequential, rate-limit-aware,
-  verified-by-actually-restoring), adapted for CockroachDB's own
-  `BACKUP`/`RESTORE` SQL statements instead of GitLab's export API.
-- A separate Jenkins pipeline (or a manual-approval-gated stage) for
-  restore verification, matching that project's own split between
-  `backup.yml` and `backup_and_verify.yml`.
-
-## Upgrade (`ACTION=upgrade`)
+## Rolling upgrade (`ACTION=upgrade`)
 
 Rolling, one node at a time: pre-check → backup → upgrade node → health
 check → repeat per node → final cluster verification. Never restart all
@@ -63,23 +13,17 @@ supports upgrading one major version at a time) before starting - verify
 the actual current compatibility rules against the docs at upgrade time,
 don't assume last year's rules still apply.
 
-## Load Balancing (HAProxy)
+## Real multi-physical-host deployment
 
-Health-checked reverse proxy in front of the SQL port
-(`cockroach_sql_port`) so the application never depends on any single
-node's address directly. Health check against each node's
-`/health?ready=1` (not plain `/health`) so a node that's up but not
-cluster-ready doesn't receive traffic.
-
-## Monitoring (Prometheus + Grafana)
-
-Prometheus scrape config against `/_status/vars` on each node's HTTP
-port. Grafana dashboards: node availability, CPU, memory, disk
-usage/latency, SQL latency, QPS, connection count, under-replicated /
-unavailable ranges, Raft, node restarts, certificate expiration.
-Alerting rules for the same. The DB Console (already reachable in the
-MVP) covers ad-hoc inspection; Prometheus/Grafana is for
-trend/alerting, not a replacement for it.
+Everything built so far (scale-out, scale-in, HAProxy, monitoring) was
+verified against a demo cluster where all "hosts" share one real sandbox
+machine (`inventory/hosts.3node-local-demo.ini`). The mechanism is
+proven; genuine host-level HA (a real server going down and the cluster
+surviving it) still needs real separate hosts to mean anything. When
+real hosts exist: point `inventory/hosts.ini` at them (real
+`ansible_host` IPs, real resolvable `cockroach_advertise_addr` hostnames,
+no `ansible_connection=local`), confirm DNS resolution between them, and
+re-verify the failure-scenario runbook below against real host failures.
 
 ## Preflight validation - the rest of the list
 
@@ -93,10 +37,31 @@ cluster before a join is attempted.
 
 ## Failure-scenario runbook
 
-Container failure, host failure, disk full/failed, network partition,
-certificate expiration, lost node, lost quorum, corrupted volume, load
-balancer failure, Docker daemon failure - each needs a documented
-runbook entry once there's a real multi-node cluster to actually test
-these against. Writing the runbook without a real cluster to verify
-against would just be guessing - do this once Phase 2's 3-node cluster
-exists.
+Demonstrated for real already: a down HAProxy backend node, and a
+decommissioned node - both left the rest of the cluster fully available.
+Still needed, and specifically requiring a real multi-physical-host
+cluster to test meaningfully (this sandbox's nodes all share one
+machine's fate): disk full, disk failure, network partition, certificate
+expiration, lost quorum (losing 2 of 3 nodes), corrupted volume, load
+balancer failure, Docker daemon failure on one host. Write each entry
+against a real test of that failure, not a guess.
+
+## Full-cluster backup / incremental backups
+
+The current backup role (`roles/cockroach_backup`) backs up one specific
+demo database (`BACKUP DATABASE ... INTO ...`), chosen so restore-verify
+can round-trip into the *same* running cluster without needing a whole
+separate disposable CockroachDB cluster. A real production deployment
+likely wants whole-cluster `BACKUP INTO ...` and scheduled incrementals
+(`BACKUP INTO LATEST IN ...`) plus retention pruning (mirroring
+`gitlab-backup-with-jenkins-ansible`'s own retention approach) - same
+mechanism, just a different backup target and a cron/Jenkins schedule,
+not a redesign.
+
+## TLS cert rotation / SAN list changes
+
+`roles/cockroach_tls` deliberately never regenerates an existing node
+cert automatically (see its own comments) - adding a node whose address
+isn't already covered by the shared node cert's SAN list needs a
+deliberate, documented rolling cert refresh across every existing node,
+not an automatic one. Not yet designed in detail.

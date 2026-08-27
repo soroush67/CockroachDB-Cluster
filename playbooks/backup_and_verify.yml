@@ -1,0 +1,11 @@
+---
+- name: Backup CockroachDB, then prove the backup is actually restorable
+  hosts: cockroach_nodes
+  gather_facts: true
+  roles:
+    - cockroach_backup
+  tasks:
+    - name: Run restore verification
+      include_role:
+        name: cockroach_backup
+        tasks_from: run_restore_verify

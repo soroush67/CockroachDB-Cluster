@@ -1,0 +1,132 @@
+---
+# Prometheus + Grafana, cluster-wide singleton infra like HAProxy -
+# delegate_to: localhost + run_once: true throughout.
+
+- name: Determine which docker compose command form the control node has
+  command: docker compose version
+  register: cockroach_mon_compose_plugin_check
+  changed_when: false
+  failed_when: false
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_monitoring
+
+- name: Determine standalone docker-compose availability (control node)
+  command: docker-compose version
+  register: cockroach_mon_compose_standalone_check
+  changed_when: false
+  failed_when: false
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_monitoring and cockroach_mon_compose_plugin_check.rc != 0
+
+- name: Record the control node's compose command form
+  set_fact:
+    cockroach_mon_compose_cmd: >-
+      {{ 'docker compose' if cockroach_mon_compose_plugin_check.rc | default(1) == 0
+         else 'docker-compose' if cockroach_mon_compose_standalone_check.rc | default(1) == 0
+         else '' }}
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_monitoring
+
+- name: Set the shared monitoring compose directory
+  set_fact:
+    cockroach_monitoring_compose_root: "{{ cockroach_project_root }}/compose/monitoring"
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_monitoring
+
+- name: Ensure the monitoring compose directory exists
+  # 0755, not 0750 - Prometheus (uid 65534/nobody) and Grafana (uid
+  # 472, gid 0) are neither soroush nor soroush's group, same reasoning
+  # as roles/load_balancer's haproxy.cfg fix.
+  file:
+    path: "{{ cockroach_monitoring_compose_root }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_monitoring
+
+- name: Render prometheus.yml
+  template:
+    src: "{{ cockroach_project_root }}/templates/prometheus.yml.j2"
+    dest: "{{ cockroach_monitoring_compose_root }}/prometheus.yml"
+    mode: "0644"
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_monitoring
+
+- name: Render the Grafana Prometheus datasource
+  template:
+    src: "{{ cockroach_project_root }}/templates/grafana-datasource.yml.j2"
+    dest: "{{ cockroach_monitoring_compose_root }}/grafana-datasource.yml"
+    mode: "0644"
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_monitoring
+
+- name: Render the Grafana dashboard provider
+  template:
+    src: "{{ cockroach_project_root }}/templates/grafana-dashboard-provider.yml.j2"
+    dest: "{{ cockroach_monitoring_compose_root }}/grafana-dashboard-provider.yml"
+    mode: "0644"
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_monitoring
+
+- name: Copy the CockroachDB Grafana dashboard
+  # A plain copy, not a template - nothing in it needs per-cluster
+  # substitution (all Prometheus queries are cluster-wide aggregates).
+  copy:
+    src: "{{ cockroach_project_root }}/templates/grafana-cockroachdb-dashboard.json"
+    dest: "{{ cockroach_monitoring_compose_root }}/grafana-cockroachdb-dashboard.json"
+    mode: "0644"
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_monitoring
+
+- name: Render the monitoring docker-compose.yml
+  template:
+    src: "{{ cockroach_project_root }}/templates/docker-compose.monitoring.yml.j2"
+    dest: "{{ cockroach_monitoring_compose_root }}/docker-compose.yml"
+    mode: "0640"
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_monitoring
+
+- name: Start (or reconcile) Prometheus + Grafana
+  command: "{{ cockroach_mon_compose_cmd }} -f {{ cockroach_monitoring_compose_root }}/docker-compose.yml up -d"
+  args:
+    chdir: "{{ cockroach_monitoring_compose_root }}"
+  changed_when: true
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_monitoring
+
+- name: Wait for Prometheus to listen
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ cockroach_prometheus_port }}"
+    timeout: 30
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_monitoring
+
+- name: Wait for Grafana to listen
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ cockroach_grafana_port }}"
+    timeout: 30
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_monitoring
+
+- name: Report monitoring started
+  debug:
+    msg: >-
+      Prometheus: http://localhost:{{ cockroach_prometheus_port }}/targets
+      Grafana: http://localhost:{{ cockroach_grafana_port }}/ (anonymous viewer access)
+  run_once: true
+  when: cockroach_enable_monitoring

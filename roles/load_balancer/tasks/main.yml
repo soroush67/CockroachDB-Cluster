@@ -1,0 +1,108 @@
+---
+# HAProxy is standing, cluster-wide infrastructure (like cockroach_tls's
+# certs) - deployed once via delegate_to: localhost + run_once: true,
+# never per-host, same pattern already used there.
+
+- name: Determine which docker compose command form the control node has
+  # Same detection as roles/preflight, but re-run here rather than
+  # relying on that role's per-host fact: this role always runs
+  # delegate_to: localhost, a context roles/preflight never actually
+  # executes in when the play's target hosts aren't literally named
+  # "localhost" (this sandbox's 3-node demo inventory uses crdb1/crdb2/crdb3,
+  # not "localhost", so no host in the play ever set that fact for
+  # Ansible's implicit-localhost delegate target).
+  command: docker compose version
+  register: cockroach_lb_compose_plugin_check
+  changed_when: false
+  failed_when: false
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_load_balancer
+
+- name: Determine standalone docker-compose availability (control node)
+  command: docker-compose version
+  register: cockroach_lb_compose_standalone_check
+  changed_when: false
+  failed_when: false
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_load_balancer and cockroach_lb_compose_plugin_check.rc != 0
+
+- name: Record the control node's compose command form
+  set_fact:
+    cockroach_lb_compose_cmd: >-
+      {{ 'docker compose' if cockroach_lb_compose_plugin_check.rc | default(1) == 0
+         else 'docker-compose' if cockroach_lb_compose_standalone_check.rc | default(1) == 0
+         else '' }}
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_load_balancer
+
+- name: Set the shared HAProxy compose directory
+  set_fact:
+    cockroach_lb_compose_root: "{{ cockroach_project_root }}/compose/haproxy"
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_load_balancer
+
+- name: Ensure the HAProxy compose directory exists
+  # 0755, not 0750 - haproxy.cfg inside needs to be reachable by uid 99
+  # (the image's own user, not in soroush's group), and a file's own
+  # read bit doesn't matter if the containing directory blocks traversal
+  # first.
+  file:
+    path: "{{ cockroach_lb_compose_root }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_load_balancer
+
+- name: Render haproxy.cfg
+  # World-readable, not 0640 - the official haproxy image runs as uid 99
+  # (confirmed directly), which can't read a file only its owner/group
+  # can. No secrets live in this file (just hostnames/ports), so this is
+  # a safe trade-off, unlike the CockroachDB certs/data (owned by a
+  # matching uid instead, see roles/cockroach_node).
+  template:
+    src: "{{ cockroach_project_root }}/templates/haproxy.cfg.j2"
+    dest: "{{ cockroach_lb_compose_root }}/haproxy.cfg"
+    mode: "0644"
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_load_balancer
+
+- name: Render the HAProxy docker-compose.yml
+  template:
+    src: "{{ cockroach_project_root }}/templates/docker-compose.haproxy.yml.j2"
+    dest: "{{ cockroach_lb_compose_root }}/docker-compose.yml"
+    mode: "0640"
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_load_balancer
+
+- name: Start (or reconcile) HAProxy
+  command: "{{ cockroach_lb_compose_cmd }} -f {{ cockroach_lb_compose_root }}/docker-compose.yml up -d"
+  args:
+    chdir: "{{ cockroach_lb_compose_root }}"
+  changed_when: true
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_load_balancer
+
+- name: Wait for HAProxy's own container healthcheck / listening port
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ cockroach_lb_sql_port }}"
+    timeout: 30
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_enable_load_balancer
+
+- name: Report HAProxy started
+  debug:
+    msg: >-
+      HAProxy listening on {{ cockroach_lb_sql_port }} (stats:
+      http://localhost:{{ cockroach_lb_stats_port }}/)
+  run_once: true
+  when: cockroach_enable_load_balancer

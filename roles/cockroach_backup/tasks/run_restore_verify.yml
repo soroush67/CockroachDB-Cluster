@@ -1,0 +1,74 @@
+---
+# Included after roles/cockroach_backup's main.yml has already run in the
+# same play (reuses cockroach_backup_target/cockroach_mc_host_env facts
+# it set) - proves the backup just taken is actually restorable, not
+# just that BACKUP returned success. Same discipline as
+# gitlab-backup-with-jenkins-ansible's backup_and_verify.yml.
+
+- name: Get the source table's row count before restore
+  command: >-
+    docker run --rm --network host
+    -v {{ cockroach_certs_root }}:/certs
+    {{ cockroach_image }}:{{ cockroach_version }}
+    sql --certs-dir=/certs --host={{ cockroach_backup_target.advertise_addr }}:{{ cockroach_backup_target.sql_port }}
+    --format=csv -e "SELECT count(*) FROM phase2_backup_demo.demo_records;"
+  register: cockroach_restore_source_count
+  changed_when: false
+  delegate_to: localhost
+  run_once: true
+
+- name: Pick a unique name for the verification database
+  set_fact:
+    cockroach_restore_verify_db: "restore_verify_{{ lookup('pipe', 'date +%s') }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: Restore the latest backup under a new, disposable database name
+  command: >-
+    docker run --rm --network host
+    -v {{ cockroach_certs_root }}:/certs
+    {{ cockroach_image }}:{{ cockroach_version }}
+    sql --certs-dir=/certs --host={{ cockroach_backup_target.advertise_addr }}:{{ cockroach_backup_target.sql_port }}
+    -e "RESTORE DATABASE phase2_backup_demo FROM LATEST IN '{{ cockroach_backup_s3_uri }}' WITH new_db_name = '{{ cockroach_restore_verify_db }}';"
+  register: cockroach_restore_result
+  changed_when: true
+  delegate_to: localhost
+  run_once: true
+
+- name: Get the restored table's row count
+  command: >-
+    docker run --rm --network host
+    -v {{ cockroach_certs_root }}:/certs
+    {{ cockroach_image }}:{{ cockroach_version }}
+    sql --certs-dir=/certs --host={{ cockroach_backup_target.advertise_addr }}:{{ cockroach_backup_target.sql_port }}
+    --format=csv -e "SELECT count(*) FROM {{ cockroach_restore_verify_db }}.demo_records;"
+  register: cockroach_restore_verify_count
+  changed_when: false
+  delegate_to: localhost
+  run_once: true
+
+- name: Drop the verification database
+  # Deliberately BEFORE the assert below, not after - a failed
+  # verification still shouldn't leave a disposable database behind, and
+  # this task has no dependency on the assert's outcome.
+  command: >-
+    docker run --rm --network host
+    -v {{ cockroach_certs_root }}:/certs
+    {{ cockroach_image }}:{{ cockroach_version }}
+    sql --certs-dir=/certs --host={{ cockroach_backup_target.advertise_addr }}:{{ cockroach_backup_target.sql_port }}
+    -e "DROP DATABASE IF EXISTS {{ cockroach_restore_verify_db }} CASCADE;"
+  changed_when: true
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert the restored row count matches the source
+  assert:
+    that: cockroach_restore_source_count.stdout_lines[-1] == cockroach_restore_verify_count.stdout_lines[-1]
+    fail_msg: >-
+      Restore verification FAILED: source had
+      {{ cockroach_restore_source_count.stdout_lines[-1] }} row(s), restored
+      copy had {{ cockroach_restore_verify_count.stdout_lines[-1] }}.
+    success_msg: >-
+      Restore verified: {{ cockroach_restore_verify_count.stdout_lines[-1] }}
+      row(s) match the source.
+  run_once: true

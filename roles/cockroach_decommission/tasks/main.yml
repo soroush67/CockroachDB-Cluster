@@ -1,0 +1,146 @@
+---
+# Never just `docker compose down` - a real decommission workflow:
+# resolve node ID -> health/quorum guard -> `cockroach node decommission`
+# (blocks until replica evacuation finishes on its own - confirmed
+# default --wait=all behavior, no separate Ansible-side polling loop
+# needed) -> verify -> stop the container -> data removal as a SEPARATE,
+# explicitly-gated step. Run with --limit <target_host> - the play's
+# only host IS the node being removed.
+#
+# Idempotent: rerunning against an already-decommissioned node (e.g.
+# resuming after an earlier step failed) skips straight to verify/stop -
+# confirmed necessary for real: a node already fully decommissioned
+# stops appearing in plain `node status` output at all, which broke a
+# naive "row count - 1" guard on a second run.
+
+- name: Pick a different, healthy node to run every cluster command against
+  # NOT this host's own address - a node that's already mid/post-
+  # decommission refuses new client connections to itself ("server is
+  # not accepting clients, try another node"), confirmed directly.
+  set_fact:
+    cockroach_decommission_via: >-
+      {{ (groups['cockroach_nodes']
+          | map('extract', hostvars, 'cockroach_local_nodes')
+          | list | flatten
+          | rejectattr('name', 'equalto', inventory_hostname) | first) }}
+  delegate_to: localhost
+
+- name: Query full cluster node status (including decommission state)
+  # --decommission, not plain `node status` - exposes the
+  # membership/is_decommissioning columns needed both to check whether
+  # this node is already decommissioned (idempotency) and to verify
+  # completion later. Confirmed the plain (non---decommission) form
+  # lacks these columns entirely.
+  command: >-
+    docker run --rm --network host
+    -v {{ cockroach_certs_root }}:/certs
+    {{ cockroach_image }}:{{ cockroach_version }}
+    node status --certs-dir=/certs --host={{ cockroach_decommission_via.advertise_addr }}:{{ cockroach_decommission_via.sql_port }} --decommission --format=tsv
+  register: cockroach_decommission_status_raw
+  changed_when: false
+  delegate_to: localhost
+
+- name: Parse node status into rows
+  set_fact:
+    cockroach_decommission_rows: "{{ cockroach_decommission_rows | default([]) + [item.split('\t')] }}"
+  loop: "{{ cockroach_decommission_status_raw.stdout_lines[1:] }}"
+  loop_control:
+    label: "row {{ item.split('\t')[0] }}"
+  delegate_to: localhost
+
+- name: Resolve this host's own node ID and current membership
+  set_fact:
+    cockroach_decommission_node_id: >-
+      {{ (cockroach_decommission_rows
+          | selectattr('1', 'equalto', cockroach_advertise_addr ~ ':' ~ (cockroach_sql_port | string))
+          | map(attribute='0') | first) }}
+    cockroach_decommission_already_done: >-
+      {{ (cockroach_decommission_rows
+          | selectattr('1', 'equalto', cockroach_advertise_addr ~ ':' ~ (cockroach_sql_port | string))
+          | map(attribute=12) | first) == 'decommissioned' }}
+  delegate_to: localhost
+
+- name: Refuse to decommission below the minimum remaining node count
+  # Only checked on a fresh decommission - an already-decommissioned
+  # node no longer counts toward "remaining active nodes" either way, so
+  # this guard doesn't apply when just resuming.
+  assert:
+    that: (cockroach_decommission_rows | rejectattr(12, 'equalto', 'decommissioned') | list | length) - 1 >= cockroach_min_nodes_after_decommission | int
+    fail_msg: >-
+      Refusing to decommission {{ inventory_hostname }}: this would leave
+      too few active nodes, below cockroach_min_nodes_after_decommission
+      ({{ cockroach_min_nodes_after_decommission }}) - replication factor
+      3 needs at least that many nodes to stay meaningfully replicated.
+    success_msg: "Node count check passed - safe to decommission."
+  delegate_to: localhost
+  when: not cockroach_decommission_already_done
+
+- name: "Decommission node {{ cockroach_decommission_node_id }} ({{ inventory_hostname }}) - blocks until replicas are fully evacuated"
+  command: >-
+    docker run --rm --network host
+    -v {{ cockroach_certs_root }}:/certs
+    {{ cockroach_image }}:{{ cockroach_version }}
+    node decommission {{ cockroach_decommission_node_id }}
+    --certs-dir=/certs --host={{ cockroach_decommission_via.advertise_addr }}:{{ cockroach_decommission_via.sql_port }}
+  register: cockroach_decommission_result
+  changed_when: true
+  delegate_to: localhost
+  when: not cockroach_decommission_already_done
+
+- name: Report decommission result
+  debug:
+    msg: "{{ cockroach_decommission_result.stdout_lines }}"
+  when: not cockroach_decommission_already_done
+
+- name: Verify the node shows membership=decommissioned
+  command: >-
+    docker run --rm --network host
+    -v {{ cockroach_certs_root }}:/certs
+    {{ cockroach_image }}:{{ cockroach_version }}
+    node status --certs-dir=/certs --host={{ cockroach_decommission_via.advertise_addr }}:{{ cockroach_decommission_via.sql_port }} --decommission --format=tsv
+  register: cockroach_decommission_verify_raw
+  until: >-
+    (cockroach_decommission_verify_raw.stdout_lines
+     | select('search', '^' ~ cockroach_decommission_node_id ~ '\t')
+     | map('split', '\t') | map(attribute=12) | first | default('')) == 'decommissioned'
+  retries: 6
+  delay: 5
+  changed_when: false
+  delegate_to: localhost
+
+- name: Assert the node is confirmed decommissioned
+  assert:
+    that: >-
+      (cockroach_decommission_verify_raw.stdout_lines
+       | select('search', '^' ~ cockroach_decommission_node_id ~ '\t')
+       | map('split', '\t') | map(attribute=12) | first) == 'decommissioned'
+    fail_msg: "Node {{ cockroach_decommission_node_id }} does not show membership=decommissioned after decommission - something is wrong."
+    success_msg: "Node {{ cockroach_decommission_node_id }} confirmed decommissioned (membership=decommissioned)."
+
+- name: Check whether this node's container is still running
+  command: >-
+    docker inspect --format="{{ '{{' }}.State.Running{{ '}}' }}" {{ inventory_hostname }}
+  register: cockroach_decommission_container_check
+  changed_when: false
+  failed_when: false
+
+- name: Stop this node's container (never `docker compose down` - data stays, container just stops)
+  command: "docker stop {{ inventory_hostname }}"
+  changed_when: true
+  when: cockroach_decommission_container_check.stdout | default('') == 'true'
+
+- name: Remove this node's data directory
+  # Two independent, separately-confirmed steps: decommissioning a node
+  # never implies deleting its data. Only runs when explicitly passed
+  # -e cockroach_confirm_data_removal=true - never flip the committed
+  # default.
+  file:
+    path: "{{ cockroach_data_root }}/{{ inventory_hostname }}"
+    state: absent
+  when: cockroach_confirm_data_removal | bool
+
+- name: Report data removal status
+  debug:
+    msg: >-
+      {{ 'Data directory removed.' if cockroach_confirm_data_removal | bool
+         else 'Data directory KEPT (cockroach_confirm_data_removal was not set true) - remove manually or rerun with -e cockroach_confirm_data_removal=true once you are sure.' }}

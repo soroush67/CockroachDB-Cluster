@@ -1,0 +1,16 @@
+---
+# Scale-out IS deploy.yml, run with --limit <new_host>: CockroachDB nodes
+# join via gossip once given --join pointing at existing nodes - existing
+# nodes don't need to be touched or restarted when a new one joins. The
+# compose template computes --join from the *entire* cockroach_nodes
+# group regardless of which host --limit restricts execution to, so the
+# new node's own rendered compose file already lists every node
+# (existing + itself) correctly.
+#
+# A separate file (not just "tell people to run deploy.yml --limit")
+# exists purely for operator/Jenkins naming clarity - deliberately not
+# duplicating role logic.
+#
+# Usage: ansible-playbook playbooks/scale_out.yml --limit <new_host>
+# (the new host must already be present in inventory first.)
+- import_playbook: deploy.yml

@@ -7,3 +7,5 @@
     - cockroach_tls
     - cockroach_node
     - cockroach_cluster
+    - load_balancer
+    - monitoring

@@ -1,0 +1,157 @@
+---
+# Ensures this project's own RustFS is running and the backup bucket
+# exists, then runs a real BACKUP INTO. Cluster-wide singleton, like
+# HAProxy/monitoring - delegate_to: localhost + run_once: true.
+
+- name: Assert the backup secret key is set
+  assert:
+    that: cockroach_backup_secret_key | length > 0
+    fail_msg: "cockroach_backup_secret_key must be set (-e or a Jenkins credential binding) before backing up."
+  delegate_to: localhost
+  run_once: true
+
+- name: Determine which docker compose command form the control node has
+  command: docker compose version
+  register: cockroach_backup_compose_plugin_check
+  changed_when: false
+  failed_when: false
+  delegate_to: localhost
+  run_once: true
+
+- name: Determine standalone docker-compose availability (control node)
+  command: docker-compose version
+  register: cockroach_backup_compose_standalone_check
+  changed_when: false
+  failed_when: false
+  delegate_to: localhost
+  run_once: true
+  when: cockroach_backup_compose_plugin_check.rc != 0
+
+- name: Record the control node's compose command form
+  set_fact:
+    cockroach_backup_compose_cmd: >-
+      {{ 'docker compose' if cockroach_backup_compose_plugin_check.rc | default(1) == 0
+         else 'docker-compose' if cockroach_backup_compose_standalone_check.rc | default(1) == 0
+         else '' }}
+  delegate_to: localhost
+  run_once: true
+
+- name: Set the shared RustFS compose directory
+  set_fact:
+    cockroach_backup_compose_root: "{{ cockroach_project_root }}/compose/rustfs"
+  delegate_to: localhost
+  run_once: true
+
+- name: Ensure the RustFS compose directory exists
+  file:
+    path: "{{ cockroach_backup_compose_root }}"
+    state: directory
+    mode: "0750"
+  delegate_to: localhost
+  run_once: true
+
+- name: Render the RustFS docker-compose.yml
+  template:
+    src: "{{ cockroach_project_root }}/templates/docker-compose.rustfs.yml.j2"
+    dest: "{{ cockroach_backup_compose_root }}/docker-compose.yml"
+    mode: "0640"
+  delegate_to: localhost
+  run_once: true
+
+- name: Start (or reconcile) RustFS
+  command: "{{ cockroach_backup_compose_cmd }} -f {{ cockroach_backup_compose_root }}/docker-compose.yml up -d"
+  args:
+    chdir: "{{ cockroach_backup_compose_root }}"
+  changed_when: true
+  delegate_to: localhost
+  run_once: true
+
+- name: Wait for RustFS to become healthy
+  command: docker inspect --format="{{ '{{' }}.State.Health.Status{{ '}}' }}" cockroachdb-rustfs
+  register: cockroach_rustfs_health
+  until: cockroach_rustfs_health.stdout == "healthy"
+  retries: 18
+  delay: 5
+  changed_when: false
+  delegate_to: localhost
+  run_once: true
+
+- name: Set the mc alias env var
+  # Same generic-S3-client pattern already used in
+  # gitlab-backup-with-jenkins-ansible - mc works against RustFS the same
+  # way it works against any other S3-compatible endpoint.
+  set_fact:
+    cockroach_mc_host_env: "MC_HOST_local={{ cockroach_backup_endpoint | regex_replace('^(https?://)', '\\1' + cockroach_backup_access_key + ':' + cockroach_backup_secret_key + '@') }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: Ensure the backup bucket exists
+  command: >-
+    docker run --rm --network host
+    -e {{ cockroach_mc_host_env }}
+    minio/mc:latest mb --ignore-existing local/{{ cockroach_backup_bucket }}
+  changed_when: true
+  delegate_to: localhost
+  run_once: true
+
+- name: Determine which node to run BACKUP against
+  set_fact:
+    cockroach_backup_target: "{{ (groups['cockroach_nodes'] | map('extract', hostvars, 'cockroach_local_nodes') | list | flatten | first) }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: Build the S3-compatible backup URI
+  # AWS_USE_PATH_STYLE=true - confirmed required directly: without it,
+  # CockroachDB addresses the bucket as
+  # "<bucket>.localhost:9020" (AWS virtual-hosted-style), which doesn't
+  # resolve for a self-hosted endpoint like RustFS - "could not find s3
+  # bucket's region: ... dial tcp: lookup cockroachdb-backups.localhost:
+  # no such host". AWS_REGION is a required-but-otherwise-unused value
+  # for a non-AWS S3-compatible endpoint (RustFS has no concept of AWS
+  # regions).
+  set_fact:
+    cockroach_backup_s3_uri: >-
+      s3://{{ cockroach_backup_bucket }}?AWS_ACCESS_KEY_ID={{ cockroach_backup_access_key }}&AWS_SECRET_ACCESS_KEY={{ cockroach_backup_secret_key }}&AWS_ENDPOINT={{ cockroach_backup_endpoint }}&AWS_USE_PATH_STYLE=true&AWS_REGION=us-east-1
+  delegate_to: localhost
+  run_once: true
+
+- name: Seed (or refresh) the demo database this role backs up
+  # BACKUP DATABASE <db>, not a whole-cluster BACKUP - a specific
+  # database can be restored under a different name for verification
+  # (RESTORE DATABASE ... WITH new_db_name = ...) into the SAME running
+  # cluster, without needing a whole separate disposable CockroachDB
+  # cluster the way gitlab-backup-with-jenkins-ansible's GitLab restore
+  # verification needs a disposable GitLab container. A whole-cluster
+  # BACKUP is documented as the real production shape in
+  # docs/architecture.md; this demo database exists purely so
+  # backup/restore has real, verifiable content to round-trip.
+  command: >-
+    docker run --rm --network host
+    -v {{ cockroach_certs_root }}:/certs
+    {{ cockroach_image }}:{{ cockroach_version }}
+    sql --certs-dir=/certs --host={{ cockroach_backup_target.advertise_addr }}:{{ cockroach_backup_target.sql_port }}
+    -e "
+    CREATE DATABASE IF NOT EXISTS phase2_backup_demo;
+    CREATE TABLE IF NOT EXISTS phase2_backup_demo.demo_records (id INT PRIMARY KEY, note STRING, created_at TIMESTAMPTZ DEFAULT now());
+    INSERT INTO phase2_backup_demo.demo_records (id, note) VALUES ({{ 1000000 + (100000 | random) }}, 'seeded by cockroach_backup role');
+    "
+  changed_when: true
+  delegate_to: localhost
+  run_once: true
+
+- name: Run BACKUP DATABASE INTO the RustFS bucket
+  command: >-
+    docker run --rm --network host
+    -v {{ cockroach_certs_root }}:/certs
+    {{ cockroach_image }}:{{ cockroach_version }}
+    sql --certs-dir=/certs --host={{ cockroach_backup_target.advertise_addr }}:{{ cockroach_backup_target.sql_port }}
+    -e "BACKUP DATABASE phase2_backup_demo INTO '{{ cockroach_backup_s3_uri }}';"
+  register: cockroach_backup_result
+  changed_when: true
+  delegate_to: localhost
+  run_once: true
+
+- name: Report backup complete
+  debug:
+    msg: "{{ cockroach_backup_result.stdout_lines }}"
+  run_once: true

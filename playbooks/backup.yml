@@ -1,0 +1,6 @@
+---
+- name: Backup CockroachDB (RustFS-backed, idempotent RustFS/bucket setup)
+  hosts: cockroach_nodes
+  gather_facts: true
+  roles:
+    - cockroach_backup

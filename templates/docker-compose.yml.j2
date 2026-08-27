@@ -49,9 +49,16 @@ services:
       nofile:
         soft: {{ cockroach_ulimit_nofile }}
         hard: {{ cockroach_ulimit_nofile }}
-    ports:
-      - "{{ node.sql_port }}:{{ node.sql_port }}"
-      - "{{ node.http_port }}:{{ node.http_port }}"
+    # Host networking, not bridge+port-publishing: nodes need to reach
+    # each other by advertise_addr:port, and on this sandbox's own
+    # same-machine multi-node demo (inventory/hosts.3node-local-demo.ini)
+    # "localhost" inside a bridge-networked container is that
+    # container's OWN loopback, not the shared host's - confirmed this
+    # breaks node-to-node join before switching to host networking.
+    # Also matches common production advice for CockroachDB-in-Docker on
+    # a dedicated single-node-per-host deployment (Scenario B) - avoids
+    # Docker NAT overhead for a database's own traffic.
+    network_mode: host
     volumes:
       - "{{ cockroach_data_root }}/{{ node.name }}:/cockroach/cockroach-data"
       - "{{ cockroach_certs_root }}:/cockroach/certs:ro"

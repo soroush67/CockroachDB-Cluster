@@ -1,0 +1,4 @@
+---
+cockroach_advertise_addr: "localhost"
+cockroach_sql_port: 26259
+cockroach_http_port: 8082

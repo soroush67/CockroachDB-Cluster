@@ -1,0 +1,10 @@
+---
+# Usage: ansible-playbook playbooks/scale_in.yml --limit <target_host>
+# The target host must already be a running, healthy member of the
+# cluster. See roles/cockroach_decommission for the actual workflow -
+# never just `docker compose down`.
+- name: Scale in (decommission) a CockroachDB node
+  hosts: cockroach_nodes
+  gather_facts: true
+  roles:
+    - cockroach_decommission

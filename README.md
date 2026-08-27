@@ -1,12 +1,13 @@
 # CockroachDB-Cluster
 
 Production-shaped, secure, idempotent CockroachDB deployment automation:
-`Jenkins + Ansible + Docker Compose`. Currently a **single-node MVP** -
-see `docs/architecture.md` for the full target (multi-host scale-out,
-HAProxy, Prometheus/Grafana, backup/restore, rolling upgrade) and
-`docs/roadmap.md` for what's Phase 2 and not yet built.
+`Jenkins + Ansible + Docker Compose`. Scale-out/in (with proper
+decommission), backup/restore, HAProxy, and Prometheus/Grafana are all
+built and verified for real against a 3-4 node demo cluster - see
+`docs/architecture.md` for the full picture and `docs/roadmap.md` for
+what's left (rolling upgrade, real multi-physical-host deployment).
 
-## Quickstart (this repo's own sandbox testing)
+## Quickstart (single-node, default inventory)
 
 ```
 ansible-playbook playbooks/deploy.yml    # idempotent - safe to rerun
@@ -17,6 +18,26 @@ ansible-playbook playbooks/status.yml    # read-only status check
 ansible_connection=local` entry - replace it with real hosts before a
 real deployment (see that file's own comments, and `docs/architecture.md`
 section 0 for Scenario A vs Scenario B).
+
+## Quickstart (3-node demo cluster, this sandbox's own verification setup)
+
+```
+ansible-playbook -i inventory/hosts.3node-local-demo.ini playbooks/deploy.yml --limit crdb1
+ansible-playbook -i inventory/hosts.3node-local-demo.ini playbooks/scale_out.yml --limit crdb2
+ansible-playbook -i inventory/hosts.3node-local-demo.ini playbooks/scale_out.yml --limit crdb3
+ansible-playbook -i inventory/hosts.3node-local-demo.ini playbooks/deploy.yml   # brings up HAProxy + monitoring
+
+# Backup/restore (needs cockroach_backup_secret_key):
+ansible-playbook -i inventory/hosts.3node-local-demo.ini playbooks/backup_and_verify.yml -e cockroach_backup_secret_key='...'
+
+# Scale in (add a 4th host to inventory/host_vars first, scale it out,
+# then decommission it back out):
+ansible-playbook -i inventory/hosts.3node-local-demo.ini playbooks/scale_in.yml --limit crdb4
+```
+
+HAProxy: `localhost:26000` (SQL), `localhost:26001` (stats). Prometheus:
+`localhost:9090`. Grafana: `localhost:3000` (anonymous viewer access,
+CockroachDB dashboard pre-provisioned).
 
 DB Console: `https://<advertise_addr>:8080` (self-signed CA - the
 browser will warn, that's expected; import `certs/ca.crt` if you want
@@ -95,3 +116,76 @@ inspect --format '{{.State.StartedAt}}'` unchanged across both runs);
 private key files (`ca.key`, `node.key`, `client.root.key`) came out
 `0600` without any extra chmod step (CockroachDB's own cert tooling sets
 this correctly); the DB Console answered `200` on `https://localhost:8080/health`.
+
+### Phase 2 (scale-out/in, backup/restore, HAProxy, monitoring)
+
+**Bridge networking breaks node-to-node join on a same-machine multi-node
+demo.** Nodes need to reach each other at `advertise_addr:port`; with the
+default bridge network + port-publishing, `localhost` inside one
+container is that container's own loopback, not the shared host's - a
+second container's published port is unreachable through it. Switched
+every container this project runs (CockroachDB, HAProxy, Prometheus,
+Grafana, RustFS) to `network_mode: host` instead - also matches common
+production advice for CockroachDB-in-Docker on a dedicated
+single-node-per-host deployment (avoids Docker NAT overhead for a
+database's own traffic).
+
+**Same root cause as the CockroachDB data-directory permission bug, hit
+again for HAProxy and Prometheus/Grafana.** `haproxy:3.2.13-alpine` runs
+as uid 99, `prom/prometheus` as uid 65534 (`nobody`), `grafana/grafana`
+as uid 472/gid 0 - none of them match the deploying host user, and none
+of their config files contain secrets, so the fix here is simpler than
+the CockroachDB data directory's uid-matching approach: render those
+config files world-readable (`0644`) and their containing directory
+world-traversable (`0755`) instead. Confirmed necessary directly:
+HAProxy crash-looped with "Could not open configuration file ...:
+Permission denied" until this was applied.
+
+**Ansible facts/role-detected vars set on one host aren't visible to a
+`delegate_to: localhost` task in a different play/host context.**
+`roles/preflight`'s compose-command detection sets a fact scoped to
+whatever host is executing that role - fine for `roles/cockroach_node`
+running later on the *same* host, but `roles/load_balancer`,
+`roles/monitoring`, and `roles/cockroach_backup` all run
+`delegate_to: localhost`, and this sandbox's demo inventory hosts are
+named `crdb1`/`crdb2`/`crdb3`, not literally `localhost` - so Ansible's
+implicit-localhost delegate target never had that fact set by anything.
+Fixed by re-running the same tiny compose-command detection inline in
+each of those roles rather than relying on a cross-host fact.
+
+**`AWS_USE_PATH_STYLE=true` is required, not optional, for `BACKUP`
+against a self-hosted S3-compatible endpoint.** Without it, CockroachDB
+addresses the bucket AWS-virtual-hosted-style
+(`<bucket>.localhost:9020`), which doesn't resolve - confirmed directly:
+"could not find s3 bucket's region: ... dial tcp: lookup
+cockroachdb-backups.localhost: no such host". `AWS_REGION` also has to
+be set to *something* even though RustFS has no concept of AWS regions -
+without it CockroachDB's region-lookup step fails outright.
+
+**A node that's already fully decommissioned refuses new SQL
+connections to itself, and disappears from plain `node status` output
+entirely.** Two related bugs found running `roles/cockroach_decommission`
+against an already-decommissioned node (simulating a resumed operation
+after an earlier step failed): (1) the role initially queried cluster
+status by connecting to the target node's own address, which failed
+with "server is not accepting clients, try another node" once that node
+was already draining - fixed by always querying/commanding through a
+*different*, healthy node instead. (2) The "how many nodes would remain"
+guard counted rows from plain `node status`, but a fully-decommissioned
+node stops appearing there at all (it only shows up with the
+`--decommission` flag, under a `membership` column) - a naive "row
+count minus one" check was wrong on a rerun. Fixed by checking
+`membership=decommissioned` explicitly (idempotency: skip straight to
+verify/cleanup if already true) and always using `--decommission` for
+any status query this role needs.
+
+**Verified end-to-end, Phase 2:** scaled a real 3-node demo cluster out
+to 4 nodes and back down via decommission, with `docker inspect
+--format '{{.State.StartedAt}}'` confirming zero unwanted restarts of
+untouched nodes throughout; ran SQL through HAProxy and confirmed
+automatic failover when a backend node was stopped; confirmed Prometheus
+scraped all nodes (`/targets` → `UP`) with real live metric values, and
+that Grafana's provisioned dashboard/datasource loaded correctly; ran a
+real `BACKUP DATABASE` + `RESTORE ... WITH new_db_name` round-trip with
+actual seeded data, confirmed row counts matched, and confirmed no
+leftover verification database after cleanup.

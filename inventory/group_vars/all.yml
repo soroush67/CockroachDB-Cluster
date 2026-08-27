@@ -17,7 +17,13 @@ cockroach_project_root: "{{ playbook_dir }}/.."
 # below and roles/preflight, which enforces this once you flip it on.
 cockroach_data_root: "{{ cockroach_project_root }}/data"
 cockroach_certs_root: "{{ cockroach_project_root }}/certs"
-cockroach_compose_root: "{{ cockroach_project_root }}/compose"
+# Host-scoped, not one fixed path - harmless extra subdirectory on real
+# separate physical hosts, but required for correctness once more than
+# one inventory host can land on the same real machine (this sandbox's
+# own 3-node local demo, inventory/hosts.3node-local-demo.ini, is
+# exactly that case) - without this, two such hosts would silently
+# overwrite each other's rendered docker-compose.yml.
+cockroach_compose_root: "{{ cockroach_project_root }}/compose/{{ inventory_hostname }}"
 
 # When true, roles/preflight refuses to deploy unless cockroach_data_root
 # is a real, separate mountpoint (checked via `mountpoint -q`) - stops
@@ -67,3 +73,40 @@ cockroach_ulimit_nofile: 65535
 # CockroachDB's built-in superuser - no separate user management needed
 # for this MVP.
 cockroach_client_user: "root"
+
+# --- Phase 2 ---
+
+# HAProxy and Prometheus/Grafana are standing cluster-wide infrastructure
+# (like cockroach_tls's certs, deployed once via delegate_to: localhost
+# + run_once: true, not per-host) - on by default now that Phase 2 builds
+# them; flip off for a deliberately minimal single-node deploy.
+cockroach_enable_load_balancer: true
+cockroach_enable_monitoring: true
+
+cockroach_lb_sql_port: 26000
+cockroach_lb_stats_port: 26001
+
+cockroach_prometheus_port: 9090
+cockroach_grafana_port: 3000
+
+# Decommissioning below this many remaining nodes is refused by
+# roles/cockroach_decommission - replication factor 3 (CockroachDB's
+# default) needs at least 3 nodes to stay meaningfully replicated.
+cockroach_min_nodes_after_decommission: 3
+
+# Two independent, separately-confirmed steps per the spec's own
+# requirement: decommissioning a node never implies deleting its data.
+# Must be passed explicitly (-e cockroach_confirm_data_removal=true) -
+# never flip this default in a committed file.
+cockroach_confirm_data_removal: false
+
+# This project's own RustFS instance (not gitlab-backup-with-jenkins-ansible's -
+# kept self-contained, see docs/architecture.md section 16). Ports
+# deliberately different from that sibling project's own RustFS
+# (9010/9011) so both can run on this same sandbox machine at once
+# without colliding.
+cockroach_backup_endpoint: "http://localhost:9020"
+cockroach_backup_console_port: 9021
+cockroach_backup_access_key: "cockroachbackup"
+cockroach_backup_secret_key: ""
+cockroach_backup_bucket: "cockroachdb-backups"

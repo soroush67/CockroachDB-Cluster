@@ -1,0 +1,75 @@
+{
+  "title": "CockroachDB Cluster",
+  "uid": "cockroachdb-cluster",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Live Nodes",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "liveness_livenodes", "legendFormat": "{{node_id}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "SQL Connections",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        { "expr": "sum(sql_conns)", "legendFormat": "connections" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "CPU % (normalized)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "sys_cpu_combined_percent_normalized * 100", "legendFormat": "node {{node_id}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "SQL Queries / sec",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        { "expr": "sum(rate(sql_query_count[1m]))", "legendFormat": "queries/sec" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "SQL Service Latency (p99)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(sql_service_latency_bucket[5m])) by (le))",
+          "legendFormat": "p99 latency (ns)"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Ranges / Under-replicated",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        { "expr": "sum(ranges)", "legendFormat": "total ranges" },
+        { "expr": "sum(ranges_underreplicated)", "legendFormat": "under-replicated" },
+        { "expr": "sum(ranges_unavailable)", "legendFormat": "unavailable" }
+      ]
+    }
+  ]
+}
