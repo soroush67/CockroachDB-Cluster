@@ -1,0 +1,63 @@
+---
+- name: Determine which node to target for cluster init and status checks
+  set_fact:
+    cockroach_init_target: "{{ (groups['cockroach_nodes'] | map('extract', hostvars, 'cockroach_local_nodes') | list | flatten | first) }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: Initialize the cluster (idempotent - already-initialized is success, not failure)
+  # Reuses the exact idempotency pattern already found and proven for
+  # real in platform-of-platform's own docker-compose cockroach-init
+  # service: `cockroach init` itself isn't idempotent, but both "Cluster
+  # successfully initialized" (first run) and "...already been
+  # initialized" (every rerun after) mean the cluster is already in the
+  # desired state - only any other outcome is a real failure.
+  shell: >-
+    set -o pipefail;
+    docker run --rm --network host
+    -v {{ cockroach_certs_root }}:/certs
+    {{ cockroach_image }}:{{ cockroach_version }}
+    init --certs-dir=/certs --host={{ cockroach_init_target.advertise_addr }}:{{ cockroach_init_target.sql_port }} 2>&1
+    | tee /tmp/cockroach_init.log;
+    grep -qE "Cluster successfully initialized|already been initialized" /tmp/cockroach_init.log
+  args:
+    executable: /bin/bash
+  delegate_to: localhost
+  run_once: true
+  register: cockroach_init_result
+  changed_when: "'Cluster successfully initialized' in cockroach_init_result.stdout"
+
+- name: Verify the target node is a healthy member of the cluster
+  command: >-
+    docker run --rm --network host
+    -v {{ cockroach_certs_root }}:/certs
+    {{ cockroach_image }}:{{ cockroach_version }}
+    node status --certs-dir=/certs --host={{ cockroach_init_target.advertise_addr }}:{{ cockroach_init_target.sql_port }} --format=tsv
+  delegate_to: localhost
+  run_once: true
+  register: cockroach_node_status_result
+  until: cockroach_node_status_result.rc == 0
+  retries: 12
+  delay: 5
+  changed_when: false
+
+- name: Verify the DB Console / HTTP readiness endpoint responds ready
+  # ?ready=1 (unlike the container-level healthcheck, which deliberately
+  # checks plain /health) needs the cluster to actually be initialized -
+  # this task runs after cockroach init above specifically so that's true.
+  uri:
+    url: "https://{{ cockroach_init_target.advertise_addr }}:{{ cockroach_init_target.http_port }}/health?ready=1"
+    validate_certs: false
+    status_code: 200
+  delegate_to: localhost
+  run_once: true
+  register: cockroach_ready_check
+  until: cockroach_ready_check.status | default(0) == 200
+  retries: 12
+  delay: 5
+  changed_when: false
+
+- name: Report cluster status
+  debug:
+    msg: "{{ cockroach_node_status_result.stdout_lines }}"
+  run_once: true

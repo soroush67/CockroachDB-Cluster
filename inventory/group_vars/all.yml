@@ -1,0 +1,69 @@
+---
+# Pinned to an exact tag, not `:latest` - a CockroachDB node restart that
+# silently pulls a newer major version is exactly the kind of surprise
+# this platform is meant to prevent (see docs/roadmap.md's Rolling
+# Upgrade section for how version changes should actually happen).
+# v26.2.x is current as of this writing - confirmed against
+# cockroachlabs.com/docs, not assumed from memory.
+cockroach_image: "cockroachdb/cockroach"
+cockroach_version: "v26.2.5"
+
+cockroach_project_root: "{{ playbook_dir }}/.."
+
+# PRODUCTION: point this at a real, dedicated disk mount, e.g.
+# /data/cockroach - never the same filesystem as the OS. The default
+# here is project-local, for this sandbox's own testing only, since
+# there's no second disk to mount here. See cockroach_require_dedicated_mount
+# below and roles/preflight, which enforces this once you flip it on.
+cockroach_data_root: "{{ cockroach_project_root }}/data"
+cockroach_certs_root: "{{ cockroach_project_root }}/certs"
+cockroach_compose_root: "{{ cockroach_project_root }}/compose"
+
+# When true, roles/preflight refuses to deploy unless cockroach_data_root
+# is a real, separate mountpoint (checked via `mountpoint -q`) - stops
+# CockroachDB from silently writing to the root filesystem if a disk
+# failed to mount. Off by default because this sandbox's data root is
+# deliberately project-local, not a dedicated disk. Set true in
+# production group_vars/host_vars once cockroach_data_root points at
+# real dedicated storage.
+cockroach_require_dedicated_mount: false
+
+# Confirmed current defaults directly against the CockroachDB docs -
+# SQL clients and node-to-node traffic share 26257, the DB Console (and
+# HTTP health endpoints) use 8080.
+cockroach_sql_port: 26257
+cockroach_http_port: 8080
+
+# What this node advertises to the rest of the cluster - must be
+# reachable by every other node. Defaults to Ansible's own ansible_host;
+# override per-host (host_vars) with a real resolvable hostname in
+# production, per docs/architecture.md's DNS requirement for Scenario B.
+cockroach_advertise_addr: "{{ ansible_host | default(inventory_hostname) }}"
+
+# CockroachDB locality (region/zone) - empty by default (single sandbox
+# node has nothing meaningful to express here). Set per-host in
+# production once nodes are spread across real regions/zones, e.g.
+# "region=dc1,zone=z1" - see docs/architecture.md section 10.
+cockroach_locality: ""
+
+# One node per host by default (Scenario B, the production preference
+# from the user's own spec). Override this list in a host's host_vars to
+# run multiple nodes on one host instead (Scenario A) - the same
+# templates/docker-compose.yml.j2 renders either shape without changes.
+cockroach_local_nodes:
+  - name: "{{ inventory_hostname }}"
+    sql_port: "{{ cockroach_sql_port }}"
+    http_port: "{{ cockroach_http_port }}"
+    advertise_addr: "{{ cockroach_advertise_addr }}"
+
+# Resource limits - never hardcoded in the template itself, always from
+# here so they're adjustable per-environment without touching Jinja.
+cockroach_cpu_limit: "2"
+cockroach_mem_limit: "2g"
+cockroach_ulimit_nofile: 65535
+
+# The client certificate generated for cluster-admin/backup use (`cockroach
+# init`, `cockroach node status`, ad-hoc `cockroach sql`). "root" is
+# CockroachDB's built-in superuser - no separate user management needed
+# for this MVP.
+cockroach_client_user: "root"

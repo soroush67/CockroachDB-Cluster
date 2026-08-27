@@ -1,0 +1,9 @@
+---
+- name: Deploy CockroachDB (idempotent - safe to rerun)
+  hosts: cockroach_nodes
+  gather_facts: true
+  roles:
+    - preflight
+    - cockroach_tls
+    - cockroach_node
+    - cockroach_cluster

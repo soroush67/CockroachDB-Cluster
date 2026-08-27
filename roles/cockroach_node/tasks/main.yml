@@ -1,0 +1,74 @@
+---
+- name: Determine the uid this host's CockroachDB container should run as
+  # Must exactly own cockroach_data_root - the compose template also sets
+  # cap_drop: ALL, which strips CAP_DAC_OVERRIDE even from root, so root
+  # inside the container can no longer fall back on bypassing ownership
+  # checks either (confirmed directly: with cap_drop: ALL and a
+  # container running as root against a non-root-owned data dir, startup
+  # failed with "permission denied" writing into cockroach-data). Queried
+  # per-host via `command`, not a controller-side lookup, so this stays
+  # correct on real remote hosts too, not just this sandbox.
+  command: id -u
+  register: cockroach_run_uid
+  changed_when: false
+
+- name: Determine the gid this host's CockroachDB container should run as
+  command: id -g
+  register: cockroach_run_gid
+  changed_when: false
+
+- name: Ensure each local node's data directory exists and is owned by that user
+  file:
+    path: "{{ cockroach_data_root }}/{{ item.name }}"
+    state: directory
+    mode: "0750"
+    owner: "{{ cockroach_run_uid.stdout }}"
+    group: "{{ cockroach_run_gid.stdout }}"
+  loop: "{{ cockroach_local_nodes }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Ensure the compose directory exists
+  file:
+    path: "{{ cockroach_compose_root }}"
+    state: directory
+    mode: "0750"
+
+- name: Render this host's docker-compose.yml
+  # Full path, not a bare filename - the template lives at the project's
+  # top-level templates/ (per the requested repo layout), which Ansible's
+  # role-relative/playbook-relative template search doesn't check by
+  # default.
+  template:
+    src: "{{ cockroach_project_root }}/templates/docker-compose.yml.j2"
+    dest: "{{ cockroach_compose_root }}/docker-compose.yml"
+    mode: "0640"
+
+- name: Start (or reconcile) this host's CockroachDB node(s)
+  # Same "shell out, always report changed" convention as the docker run
+  # commands in gitlab-backup-with-jenkins-ansible - docker compose itself
+  # is what's actually idempotent here (a no-op `up -d` does nothing
+  # destructive), Ansible just isn't trying to parse that out of stderr.
+  command: "{{ cockroach_compose_cmd }} -f {{ cockroach_compose_root }}/docker-compose.yml up -d"
+  args:
+    chdir: "{{ cockroach_compose_root }}"
+  changed_when: true
+
+- name: Wait for each local node's container healthcheck to pass
+  command: >-
+    docker inspect --format="{{ '{{' }}.State.Health.Status{{ '}}' }}" {{ item.name }}
+  loop: "{{ cockroach_local_nodes }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: cockroach_node_health
+  until: cockroach_node_health.stdout == "healthy"
+  retries: 24
+  delay: 5
+  changed_when: false
+
+- name: Report node(s) started
+  debug:
+    msg: "{{ item.name }}: container healthy (sql:{{ item.sql_port }}, http:{{ item.http_port }})"
+  loop: "{{ cockroach_local_nodes }}"
+  loop_control:
+    label: "{{ item.name }}"

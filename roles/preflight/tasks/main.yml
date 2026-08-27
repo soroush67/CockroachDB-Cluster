@@ -1,0 +1,122 @@
+---
+- name: Check this user can actually talk to the Docker daemon
+  # Same check/message pattern as gitlab-backup-with-jenkins-ansible's
+  # roles that shell out to `docker run`/`docker compose` - this project
+  # hits the identical failure mode on a Jenkins agent whose user isn't
+  # in the docker group.
+  command: docker info
+  register: preflight_docker_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail cleanly if the Docker daemon isn't reachable
+  assert:
+    that: preflight_docker_check.rc == 0
+    fail_msg: >-
+      Can't talk to the Docker daemon (docker info failed):
+      {{ preflight_docker_check.stderr }}
+      This usually means the user running this playbook isn't in the
+      `docker` group on this host. Fix: `sudo usermod -aG docker $(whoami)`,
+      then restart whatever process runs this playbook.
+    success_msg: "Docker daemon reachable."
+
+- name: Check whether the docker compose plugin (v2, `docker compose`) is available
+  command: docker compose version
+  register: preflight_compose_plugin_check
+  changed_when: false
+  failed_when: false
+
+- name: Check whether the standalone docker-compose binary is available
+  # Both forms are real in the wild - this sandbox itself only has the
+  # standalone binary (confirmed directly: `docker compose version` fails
+  # here with "unknown command", `docker-compose version` succeeds),
+  # matching what gitlab-backup-with-jenkins-ansible already relies on.
+  # Production hosts may have either, so detect rather than assume.
+  command: docker-compose version
+  register: preflight_compose_standalone_check
+  changed_when: false
+  failed_when: false
+  when: preflight_compose_plugin_check.rc != 0
+
+- name: Record which docker compose command form this host actually has
+  set_fact:
+    cockroach_compose_cmd: >-
+      {{ 'docker compose' if preflight_compose_plugin_check.rc == 0
+         else 'docker-compose' if preflight_compose_standalone_check.rc | default(1) == 0
+         else '' }}
+
+- name: Fail cleanly if neither docker compose form is available
+  assert:
+    that: cockroach_compose_cmd | length > 0
+    fail_msg: >-
+      Neither `docker compose` (plugin) nor `docker-compose` (standalone)
+      is available on this host. Install docker-compose-plugin, or the
+      standalone docker-compose binary, before deploying.
+    success_msg: "Compose command available: {{ cockroach_compose_cmd }}"
+
+- name: Refuse to deploy onto the root filesystem when a dedicated mount is required
+  # Deliberately checked BEFORE anything writes to cockroach_data_root -
+  # a disk that failed to mount must never result in CockroachDB silently
+  # starting to write cluster data onto the OS disk instead.
+  command: "mountpoint -q {{ cockroach_data_root }}"
+  register: preflight_mount_check
+  changed_when: false
+  failed_when: false
+  when: cockroach_require_dedicated_mount | bool
+
+- name: Fail cleanly if cockroach_data_root isn't actually a separate mount
+  assert:
+    that: preflight_mount_check.rc == 0
+    fail_msg: >-
+      cockroach_require_dedicated_mount is true but {{ cockroach_data_root }}
+      is not a real mountpoint (mountpoint -q failed). Refusing to deploy -
+      this almost always means the intended data disk failed to mount, and
+      CockroachDB would otherwise start writing cluster data onto the OS
+      filesystem instead. Mount the real disk at that path, or set
+      cockroach_require_dedicated_mount: false if this is intentional
+      (e.g. this sandbox's own local testing).
+    success_msg: "{{ cockroach_data_root }} is a dedicated mount."
+  when: cockroach_require_dedicated_mount | bool
+
+- name: Check each local node's SQL port is free on this host
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ item.sql_port }}"
+    state: stopped
+    timeout: 1
+  loop: "{{ cockroach_local_nodes }}"
+  loop_control:
+    label: "{{ item.name }} sql:{{ item.sql_port }}"
+  register: preflight_sql_port_check
+  failed_when: false
+
+- name: Check each local node's HTTP port is free on this host
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ item.http_port }}"
+    state: stopped
+    timeout: 1
+  loop: "{{ cockroach_local_nodes }}"
+  loop_control:
+    label: "{{ item.name }} http:{{ item.http_port }}"
+  register: preflight_http_port_check
+  failed_when: false
+
+- name: Fail cleanly if any required port is already in use by something else
+  # `wait_for: state=stopped` only fails (as opposed to timing out
+  # successfully) when something IS listening - a busy port here is
+  # someone else's process, or an already-running node from a previous
+  # deploy that this same play is about to manage properly instead.
+  assert:
+    that:
+      - item.failed | default(false) == false
+    fail_msg: >-
+      Port already in use: {{ item.item.name }} needs
+      {{ item.item.sql_port }}/{{ item.item.http_port }}, but something is
+      already listening. If this is a CockroachDB container from a
+      previous run, check `docker ps` before proceeding rather than
+      forcing this port free.
+    success_msg: "{{ item.item.name }}: ports free."
+  loop: "{{ (preflight_sql_port_check.results | default([])) + (preflight_http_port_check.results | default([])) }}"
+  loop_control:
+    label: "{{ item.item.name }}"

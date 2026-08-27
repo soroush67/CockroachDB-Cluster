@@ -1,0 +1,6 @@
+certs/
+data/
+compose/
+.env
+.ansible-retry/
+*.retry

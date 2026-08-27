@@ -1,0 +1,70 @@
+# Rendered by roles/cockroach_node for {{ inventory_hostname }} - generated
+# by Ansible, do not edit by hand (re-running deploy.yml overwrites it).
+#
+# One service per entry in cockroach_local_nodes for THIS host - the same
+# template covers both:
+#   Scenario A: multiple nodes on one host (cockroach_local_nodes has
+#               several entries in that host's host_vars)
+#   Scenario B: one node per host (the default - see group_vars/all.yml)
+# which of the two you get is purely an inventory/host_vars decision, not
+# a template change.
+{% set ns = namespace(join_targets=[]) %}
+{% for h in groups['cockroach_nodes'] %}
+{%   for n in hostvars[h].cockroach_local_nodes %}
+{%     set ns.join_targets = ns.join_targets + [n.advertise_addr ~ ':' ~ n.sql_port] %}
+{%   endfor %}
+{% endfor %}
+{% set join_addrs = ns.join_targets | join(',') %}
+services:
+{% for node in cockroach_local_nodes %}
+  {{ node.name }}:
+    image: "{{ cockroach_image }}:{{ cockroach_version }}"
+    container_name: "{{ node.name }}"
+    hostname: "{{ node.name }}"
+    # Not root - must exactly match cockroach_data_root's ownership,
+    # since cap_drop: ALL below strips CAP_DAC_OVERRIDE even from root
+    # too (see roles/cockroach_node's uid/gid lookup for why).
+    user: "{{ cockroach_run_uid.stdout }}:{{ cockroach_run_gid.stdout }}"
+    command:
+      - start
+      - "--certs-dir=/cockroach/certs"
+      - "--store=/cockroach/cockroach-data"
+      - "--listen-addr=0.0.0.0:{{ node.sql_port }}"
+      - "--http-addr=0.0.0.0:{{ node.http_port }}"
+      - "--advertise-addr={{ node.advertise_addr }}:{{ node.sql_port }}"
+      - "--join={{ join_addrs }}"
+{% if cockroach_locality %}
+      - "--locality={{ cockroach_locality }}"
+{% endif %}
+    # Least-privilege by default - no `privileged: true`, no capabilities
+    # beyond what the base image itself already needs to run.
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    restart: unless-stopped
+    mem_limit: "{{ cockroach_mem_limit }}"
+    cpus: "{{ cockroach_cpu_limit }}"
+    ulimits:
+      nofile:
+        soft: {{ cockroach_ulimit_nofile }}
+        hard: {{ cockroach_ulimit_nofile }}
+    ports:
+      - "{{ node.sql_port }}:{{ node.sql_port }}"
+      - "{{ node.http_port }}:{{ node.http_port }}"
+    volumes:
+      - "{{ cockroach_data_root }}/{{ node.name }}:/cockroach/cockroach-data"
+      - "{{ cockroach_certs_root }}:/cockroach/certs:ro"
+    healthcheck:
+      # Plain /health (process alive), NOT /health?ready=1 (full cluster
+      # readiness) - a ready-state check here would deadlock the very
+      # first node's own startup, since nothing is "ready" until AFTER
+      # roles/cockroach_cluster runs `cockroach init`, which itself waits
+      # on this container being up first. Cluster-readiness is verified
+      # separately, after init, not via this container-level healthcheck.
+      test: ["CMD", "curl", "-ksf", "https://localhost:{{ node.http_port }}/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+{% endfor %}

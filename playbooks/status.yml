@@ -1,0 +1,43 @@
+---
+- name: CockroachDB cluster status (read-only - safe to run anytime)
+  hosts: cockroach_nodes
+  gather_facts: true
+  tasks:
+    - name: Determine which node to query
+      set_fact:
+        cockroach_init_target: "{{ (groups['cockroach_nodes'] | map('extract', hostvars, 'cockroach_local_nodes') | list | flatten | first) }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Query cluster node status
+      command: >-
+        docker run --rm --network host
+        -v {{ cockroach_certs_root }}:/certs
+        {{ cockroach_image }}:{{ cockroach_version }}
+        node status --certs-dir=/certs --host={{ cockroach_init_target.advertise_addr }}:{{ cockroach_init_target.sql_port }} --format=tsv
+      delegate_to: localhost
+      run_once: true
+      register: cockroach_status_result
+      changed_when: false
+
+    - name: Report cluster node status
+      debug:
+        msg: "{{ cockroach_status_result.stdout_lines }}"
+      run_once: true
+
+    - name: Check each container's Docker-level health
+      command: >-
+        docker inspect --format="{{ '{{' }}.State.Health.Status{{ '}}' }}" {{ item.name }}
+      loop: "{{ cockroach_local_nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: cockroach_container_health
+      changed_when: false
+      failed_when: false
+
+    - name: Report container health
+      debug:
+        msg: "{{ item.item.name }}: {{ item.stdout | default('unknown') }}"
+      loop: "{{ cockroach_container_health.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"

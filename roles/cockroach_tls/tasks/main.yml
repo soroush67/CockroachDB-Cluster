@@ -1,0 +1,119 @@
+---
+# Certificates are generated ONCE, on the control node (delegate_to:
+# localhost, run_once: true), never independently per target host -
+# every node and client must trust the SAME CA, so there can only be one.
+# They're then distributed to each host that needs them. For this
+# sandbox's single-localhost inventory that distribution step is a no-op
+# (same filesystem already); for real multi-host deployments it copies
+# the shared certs over the normal Ansible connection with no code
+# changes needed - this is the one part of the MVP intentionally shaped
+# for Phase 2 multi-host, per the plan.
+#
+# The `cockroach cert` CLI itself is only available inside the
+# cockroachdb/cockroach image - shelled out to via `docker run`, the same
+# pattern gitlab-backup-with-jenkins-ansible already uses for minio/mc,
+# rather than requiring a local cockroach binary on the control node.
+#
+# `--user "$(id -u):$(id -g)"` matters: the image's entrypoint runs as
+# root by default, which would leave every generated cert/key file
+# root-owned on the host bind mount (confirmed directly - a plain `docker
+# run` without --user produced root:root files this Ansible user, running
+# without become per this project's convention, couldn't even read back).
+
+- name: Ensure the certs directory exists on the control node
+  file:
+    path: "{{ cockroach_certs_root }}"
+    state: directory
+    mode: "0750"
+  delegate_to: localhost
+  run_once: true
+
+- name: Check whether the CA key already exists
+  stat:
+    path: "{{ cockroach_certs_root }}/ca.key"
+  register: cockroach_ca_key_stat
+  delegate_to: localhost
+  run_once: true
+
+- name: Generate the cluster CA (only if it doesn't already exist)
+  # Never regenerated once present - a new CA would invalidate every
+  # node/client cert already issued from the old one, on every host.
+  command: >-
+    docker run --rm
+    --user {{ lookup('pipe', 'id -u') }}:{{ lookup('pipe', 'id -g') }}
+    -v {{ cockroach_certs_root }}:/certs
+    {{ cockroach_image }}:{{ cockroach_version }}
+    cert create-ca --certs-dir=/certs --ca-key=/certs/ca.key
+  delegate_to: localhost
+  run_once: true
+  when: not cockroach_ca_key_stat.stat.exists
+
+- name: Build the SAN list for the shared node certificate
+  # Every hostname/IP any node might be reached at, across the whole
+  # cluster - localhost/127.0.0.1 for this sandbox's own docker-compose
+  # port-mapped access, plus every node's own name and advertise_addr.
+  set_fact:
+    cockroach_node_cert_sans: >-
+      {{
+        (['localhost', '127.0.0.1']
+         + (groups['cockroach_nodes'] | map('extract', hostvars, 'cockroach_local_nodes') | list | flatten | map(attribute='name') | list)
+         + (groups['cockroach_nodes'] | map('extract', hostvars, 'cockroach_local_nodes') | list | flatten | map(attribute='advertise_addr') | list))
+        | unique | list
+      }}
+  delegate_to: localhost
+  run_once: true
+
+- name: Check whether the node certificate already exists
+  stat:
+    path: "{{ cockroach_certs_root }}/node.crt"
+  register: cockroach_node_cert_stat
+  delegate_to: localhost
+  run_once: true
+
+- name: Generate the shared node certificate (only if it doesn't already exist)
+  # Re-running this after cockroach_node_cert_sans changes (e.g. a new
+  # node added in Phase 2) needs --overwrite and a rolling cert refresh
+  # across all nodes - deliberately not automatic here, since silently
+  # swapping a live cluster's node cert is exactly the kind of thing this
+  # project's idempotency rule ("rerun never surprises you") forbids.
+  # Regenerate deliberately (delete node.crt/node.key first) when scaling.
+  command: >-
+    docker run --rm
+    --user {{ lookup('pipe', 'id -u') }}:{{ lookup('pipe', 'id -g') }}
+    -v {{ cockroach_certs_root }}:/certs
+    {{ cockroach_image }}:{{ cockroach_version }}
+    cert create-node --certs-dir=/certs --ca-key=/certs/ca.key {{ cockroach_node_cert_sans | join(' ') }}
+  delegate_to: localhost
+  run_once: true
+  when: not cockroach_node_cert_stat.stat.exists
+
+- name: Check whether the client certificate already exists
+  stat:
+    path: "{{ cockroach_certs_root }}/client.{{ cockroach_client_user }}.crt"
+  register: cockroach_client_cert_stat
+  delegate_to: localhost
+  run_once: true
+
+- name: Generate the client certificate (only if it doesn't already exist)
+  command: >-
+    docker run --rm
+    --user {{ lookup('pipe', 'id -u') }}:{{ lookup('pipe', 'id -g') }}
+    -v {{ cockroach_certs_root }}:/certs
+    {{ cockroach_image }}:{{ cockroach_version }}
+    cert create-client {{ cockroach_client_user }} --certs-dir=/certs --ca-key=/certs/ca.key
+  delegate_to: localhost
+  run_once: true
+  when: not cockroach_client_cert_stat.stat.exists
+
+- name: Distribute the shared certs to this host
+  # No-op for this sandbox's localhost-only inventory (source and
+  # destination are the same filesystem already). For real remote hosts
+  # this pushes the CA/node/client certs generated above over the normal
+  # Ansible connection - the reason the whole role delegates cert
+  # generation to the control node instead of generating independently
+  # per host.
+  copy:
+    src: "{{ cockroach_certs_root }}/"
+    dest: "{{ cockroach_certs_root }}/"
+    mode: preserve
+  when: ansible_connection | default('') != 'local'
